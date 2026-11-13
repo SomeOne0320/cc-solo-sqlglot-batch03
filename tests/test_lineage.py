@@ -1379,3 +1379,279 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+    def test_lineage_include_conditions(self) -> None:
+        # The sales-report example: by default only the value source of amount
+        # is traced; with include_conditions the columns deciding whether a row
+        # appears (JOIN ON, WHERE) are traced back to their base tables too.
+        schema = {
+            "orders": {"amount": "int", "customer_id": "int"},
+            "customers": {"id": "int", "active": "int", "name": "text"},
+        }
+        sql = """
+            SELECT o.amount
+            FROM orders o
+            JOIN customers c ON o.customer_id = c.id
+            WHERE c.active = 1
+        """
+
+        node = lineage("amount", sql, schema=schema)
+        self.assertEqual({n.name for n in node.walk()}, {"amount", "o.amount"})
+
+        node = lineage("amount", sql, schema=schema, include_conditions=True)
+        self.assertEqual(
+            {n.name for n in node.walk()},
+            {"amount", "o.amount", "o.customer_id", "c.id", "c.active"},
+        )
+
+        # The condition columns hang off the amount node and bottom out at base tables.
+        self.assertEqual(
+            {d.name for d in node.downstream},
+            {"o.amount", "o.customer_id", "c.id", "c.active"},
+        )
+        leaves = {n.name: n for n in node.walk() if not n.downstream}
+        self.assertEqual(leaves["o.amount"].source.sql(), "orders AS o")
+        self.assertEqual(leaves["o.customer_id"].source.sql(), "orders AS o")
+        self.assertEqual(leaves["c.id"].source.sql(), "customers AS c")
+        self.assertEqual(leaves["c.active"].source.sql(), "customers AS c")
+
+        # Unused projections of the same query are not pulled in.
+        self.assertNotIn("c.name", {n.name for n in node.walk()})
+
+    def test_lineage_include_conditions_upstream(self) -> None:
+        # Conditions of upstream CTEs / derived tables keep being traced, while
+        # unused CTEs and pure ORDER BY columns are left out.
+        schema = {
+            "orders": {"amount": "int", "customer_id": "int", "placed_at": "date"},
+            "customers": {"id": "int", "active": "int", "name": "text"},
+        }
+        sql = """
+            WITH used AS (
+                SELECT id FROM customers WHERE active = 1
+            ),
+            unused_cte AS (
+                SELECT id, name FROM customers WHERE name = 'x'
+            )
+            SELECT o.amount
+            FROM orders o
+            JOIN used u ON o.customer_id = u.id
+            WHERE o.placed_at > '2024-01-01'
+            ORDER BY o.placed_at
+        """
+        node = lineage("amount", sql, schema=schema, include_conditions=True)
+        names = {n.name for n in node.walk()}
+        self.assertEqual(
+            names,
+            {
+                "amount",
+                "o.amount",
+                "o.customer_id",
+                "o.placed_at",
+                "u.id",
+                "customers.id",
+                "customers.active",
+            },
+        )
+
+        # The CTE's own WHERE condition is attached below the CTE column node.
+        cte_node = next(n for n in node.walk() if n.name == "u.id")
+        self.assertEqual(
+            {d.name for d in cte_node.downstream}, {"customers.id", "customers.active"}
+        )
+
+        # ORDER BY alone would not bring o.placed_at in: drop the WHERE and it disappears.
+        node = lineage(
+            "amount",
+            "SELECT o.amount FROM orders o ORDER BY o.placed_at",
+            schema=schema,
+            include_conditions=True,
+        )
+        self.assertEqual({n.name for n in node.walk()}, {"amount", "o.amount"})
+
+        # HAVING and QUALIFY conditions are traced as well.
+        node = lineage(
+            "total",
+            """
+            SELECT customer_id, SUM(amount) AS total
+            FROM orders
+            GROUP BY customer_id
+            HAVING SUM(amount) > 100
+            """,
+            schema=schema,
+            include_conditions=True,
+        )
+        self.assertIn("orders.amount", {n.name for n in node.walk()})
+
+        node = lineage(
+            "customer_id",
+            """
+            SELECT customer_id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY amount) AS rn
+            FROM orders
+            QUALIFY rn = 1
+            """,
+            schema=schema,
+            include_conditions=True,
+        )
+        self.assertIn("orders.amount", {n.name for n in node.walk()})
+
+    def test_lineage_include_conditions_subqueries(self) -> None:
+        # IN and scalar subqueries contribute the values they compare against plus
+        # their own conditions; EXISTS only contributes its matching conditions,
+        # not the constants of its SELECT list.
+        schema = {
+            "orders": {"amount": "int", "customer_id": "int", "region_id": "int"},
+            "customers": {"id": "int", "active": "int"},
+            "regions": {"id": "int"},
+        }
+        sql = """
+            SELECT o.amount
+            FROM orders o
+            WHERE o.customer_id IN (SELECT id FROM customers WHERE active = 1)
+              AND o.amount > (SELECT AVG(amount) FROM orders)
+              AND EXISTS (SELECT 1 FROM regions r WHERE r.id = o.region_id)
+        """
+        node = lineage("amount", sql, schema=schema, include_conditions=True)
+        names = {n.name for n in node.walk()}
+
+        # IN: the compared value (customers.id) and the subquery's own WHERE.
+        self.assertIn("customers.id", names)
+        self.assertIn("customers.active", names)
+
+        # Scalar subquery: the aggregated amount is traced.
+        self.assertIn("orders.amount", names)
+
+        # EXISTS: the join keys are traced, the constant projection is not.
+        self.assertIn("r.id", names)
+        self.assertIn("o.region_id", names)
+        self.assertNotIn("1", names)
+
+        # Correlated references still land on the outer table.
+        leaves = {n.name: n for n in node.walk() if not n.downstream}
+        self.assertEqual(leaves["o.region_id"].source.sql(), "orders AS o")
+        self.assertEqual(leaves["r.id"].source.sql(), "regions AS r")
+
+    def test_lineage_include_conditions_correlated_shadowing(self) -> None:
+        # Inner and outer queries reuse the same alias (o) and column names for
+        # different tables: each condition column must land on its own table,
+        # and the correlated reference to r must resolve to the outer query.
+        schema = {
+            "orders": {"amount": "int", "region_id": "int", "active": "int", "id": "int"},
+            "customers": {"id": "int", "active": "int"},
+            "regions": {"id": "int", "customer_id": "int"},
+        }
+        sql = """
+            SELECT o.amount
+            FROM orders o
+            JOIN regions r ON o.region_id = r.id
+            WHERE EXISTS (
+                SELECT 1
+                FROM customers o
+                WHERE o.active = 1 AND o.id = r.customer_id
+            )
+        """
+        node = lineage("amount", sql, schema=schema, include_conditions=True)
+        leaves = {n.name: n for n in node.walk() if not n.downstream}
+
+        # Same alias o, different tables on each nesting level.
+        self.assertEqual(leaves["o.amount"].source.sql(), "orders AS o")
+        self.assertEqual(leaves["o.region_id"].source.sql(), "orders AS o")
+        self.assertEqual(leaves["o.active"].source.sql(), "customers AS o")
+        self.assertEqual(leaves["o.id"].source.sql(), "customers AS o")
+
+        # Correlated condition referencing the outer query.
+        self.assertEqual(leaves["r.customer_id"].source.sql(), "regions AS r")
+        self.assertEqual(leaves["r.id"].source.sql(), "regions AS r")
+
+    def test_lineage_include_conditions_all_columns(self) -> None:
+        # include_conditions works with column=None, sources, a pre-built scope
+        # and the on_node hook; shared nodes stay shared and copy=True still
+        # leaves the input expression untouched.
+        from sqlglot.optimizer import qualify
+        from sqlglot.optimizer.scope import build_scope
+
+        schema = {
+            "orders": {"amount": "int", "customer_id": "int"},
+            "customers": {"id": "int", "active": "int"},
+        }
+        sql = """
+            SELECT o.amount, o.customer_id
+            FROM orders o
+            JOIN customers c ON o.customer_id = c.id
+            WHERE c.active = 1
+        """
+
+        result = lineage(None, sql, schema=schema, include_conditions=True)
+        self.assertEqual(set(result), {"amount", "customer_id"})
+        self.assertEqual(
+            {n.name for n in result["amount"].walk()},
+            {"amount", "o.amount", "o.customer_id", "c.id", "c.active"},
+        )
+        self.assertEqual(
+            {n.name for n in result["customer_id"].walk()},
+            {"customer_id", "o.customer_id", "c.id", "c.active"},
+        )
+
+        # Condition columns resolving into an upstream scope share nodes across
+        # output columns through the same cache as value columns.
+        shared = lineage(
+            None,
+            """
+            WITH ac AS (SELECT id FROM customers WHERE active = 1)
+            SELECT o.amount, o.customer_id FROM orders o JOIN ac ON o.customer_id = ac.id
+            """,
+            schema=schema,
+            include_conditions=True,
+        )
+        ac_of_amount = next(d for d in shared["amount"].downstream if d.name == "ac.id")
+        ac_of_customer_id = next(d for d in shared["customer_id"].downstream if d.name == "ac.id")
+        self.assertIs(ac_of_amount, ac_of_customer_id)
+        self.assertEqual(
+            {d.name for d in ac_of_amount.downstream}, {"customers.id", "customers.active"}
+        )
+
+        # Pre-built scope path produces the same graph.
+        qualified = qualify.qualify(
+            sqlglot.parse_one(sql),
+            schema=schema,
+            validate_qualify_columns=False,
+            identify=False,
+        )
+        scope = build_scope(qualified)
+        from_scope = lineage(None, qualified, schema=schema, scope=scope, include_conditions=True)
+        self.assertEqual(
+            {n.name for n in from_scope["amount"].walk()},
+            {n.name for n in result["amount"].walk()},
+        )
+
+        # sources= expansion keeps tracing conditions through the inlined queries.
+        node = lineage(
+            "amount",
+            "SELECT amount FROM report WHERE active = 1",
+            schema=schema,
+            sources={
+                "report": "SELECT o.amount AS amount, c.active AS active "
+                "FROM orders o JOIN customers c ON o.customer_id = c.id"
+            },
+            include_conditions=True,
+        )
+        names = {n.name for n in node.walk()}
+        self.assertIn("c.active", names)
+        self.assertIn("o.customer_id", names)
+
+        # on_node fires for condition nodes too, children before parents.
+        visited: list[str] = []
+        lineage(
+            "amount",
+            sql,
+            schema=schema,
+            include_conditions=True,
+            on_node=lambda n: visited.append(n.name),
+        )
+        self.assertIn("c.active", visited)
+        self.assertLess(visited.index("c.active"), visited.index("amount"))
+
+        # copy=True does not modify the passed-in expression.
+        ast = sqlglot.parse_one(sql)
+        ast_sql = ast.sql()
+        lineage("amount", ast, schema=schema, include_conditions=True)
+        self.assertEqual(ast.sql(), ast_sql)

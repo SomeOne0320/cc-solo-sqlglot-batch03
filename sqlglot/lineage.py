@@ -100,6 +100,7 @@ def lineage(
     trim_selects: bool = True,
     copy: bool = True,
     on_node: t.Callable[[Node], None] | None = None,
+    include_conditions: bool = False,
     **kwargs,
 ) -> Node | dict[str, Node]:
     """Build the lineage graph for a SQL query.
@@ -120,10 +121,42 @@ def lineage(
         on_node: Optional callback invoked for every Node created during the walk,
             after the Node's downstream is populated. Useful for injecting
             caller-managed data into Node.payload during the walk.
+        include_conditions: Whether to also trace the columns that decide which rows
+            appear in the result, taken from the WHERE, JOIN ON, HAVING and QUALIFY
+            clauses. Conditions of upstream CTEs and subqueries are followed as well,
+            including the projected values of IN / scalar subqueries and the
+            row-matching conditions of EXISTS subqueries. Columns used only by
+            ORDER BY, unused CTEs and unused projections are not traced.
         **kwargs: Qualification optimizer kwargs.
 
     Returns:
         A Node when `column` is provided, or a dict[str, Node] when `column` is None.
+
+    Example:
+        Trace the amount of a sales report back to its source column::
+
+            SELECT o.amount
+            FROM orders o
+            JOIN customers c ON o.customer_id = c.id
+            WHERE c.active = 1
+
+        With the default ``include_conditions=False``, the graph only contains the
+        value source ``o.amount``. Switching it on adds the condition columns that
+        determine whether a row shows up in the report, so a missing row can be
+        explained: ``o.customer_id`` and ``c.id`` from the JOIN ON, and ``c.active``
+        from the WHERE, each attached to the ``amount`` node and traceable back to
+        its base table.
+
+        >>> node = lineage(
+        ...     "amount",
+        ...     "SELECT o.amount FROM orders o "
+        ...     "JOIN customers c ON o.customer_id = c.id WHERE c.active = 1",
+        ...     schema={"orders": {"amount": "int", "customer_id": "int"},
+        ...             "customers": {"id": "int", "active": "int"}},
+        ...     include_conditions=True,
+        ... )
+        >>> sorted(n.name for n in node.walk())
+        ['amount', 'c.active', 'c.id', 'o.amount', 'o.customer_id']
     """
     expression = maybe_parse(sql, copy=copy, dialect=dialect)
 
@@ -173,6 +206,7 @@ def lineage(
             _cache=cache,
             _scope_meta=scope_meta,
             on_node=on_node,
+            include_conditions=include_conditions,
         )
 
     result: dict[str, Node] = {}
@@ -192,6 +226,7 @@ def lineage(
             _cache=cache,
             _scope_meta=scope_meta,
             on_node=on_node,
+            include_conditions=include_conditions,
         )
 
     return result
@@ -210,6 +245,7 @@ def to_node(
     _cache: dict[tuple, Node] | None = None,
     _scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None = None,
     on_node: t.Callable[[Node], None] | None = None,
+    include_conditions: bool = False,
 ) -> Node:
     cache_key = (column, id(scope), scope_name, source_name, reference_node_name)
 
@@ -262,6 +298,7 @@ def to_node(
                 _cache=_cache,
                 _scope_meta=_scope_meta,
                 on_node=on_node,
+                include_conditions=include_conditions,
             )
             # Skip caching a passed-in upstream returned by an inner SetOp:
             # a sibling call at the same key with that node as its upstream
@@ -303,6 +340,7 @@ def to_node(
                 _cache=_cache,
                 _scope_meta=_scope_meta,
                 on_node=on_node,
+                include_conditions=include_conditions,
             )
 
         if _cache is not None and created_setop:
@@ -353,6 +391,7 @@ def to_node(
                 _cache=_cache,
                 _scope_meta=_scope_meta,
                 on_node=on_node,
+                include_conditions=include_conditions,
             )
 
     # if the select is a star add all scope sources as downstreams
@@ -431,6 +470,7 @@ def to_node(
                 _cache=_cache,
                 _scope_meta=_scope_meta,
                 on_node=on_node,
+                include_conditions=include_conditions,
             )
         elif pivots and pivots[-1].alias_or_name == c.table:
             # Only the last operator in a chain names the resulting source
@@ -479,6 +519,7 @@ def to_node(
                         _cache=_cache,
                         _scope_meta=_scope_meta,
                         on_node=on_node,
+                        include_conditions=include_conditions,
                     )
                 else:
                     col_expr = col_source or exp.Placeholder()
@@ -501,6 +542,22 @@ def to_node(
             if on_node:
                 on_node(leaf)
 
+    if include_conditions:
+        # Besides producing the value, this scope also filters rows: trace the
+        # columns of its WHERE / JOIN ON / HAVING / QUALIFY clauses as well.
+        _trace_conditions(
+            scope,
+            node,
+            dialect=dialect,
+            schema=schema,
+            source_name=source_name,
+            trim_selects=trim_selects,
+            _cache=_cache,
+            _scope_meta=_scope_meta,
+            on_node=on_node,
+            skip={(c.table, c.name) for c in source_columns},
+        )
+
     if _cache is not None:
         _cache[cache_key] = node
 
@@ -508,6 +565,227 @@ def to_node(
         on_node(node)
 
     return node
+
+
+def _condition_expressions(expression: exp.Expr) -> Iterator[exp.Expr]:
+    """Yield the row-filtering expressions (WHERE, JOIN ON, HAVING, QUALIFY) of a SELECT."""
+    where = expression.args.get("where")
+    if where:
+        yield where
+
+    for join in expression.args.get("joins") or []:
+        on = join.args.get("on")
+        if on:
+            yield on
+
+    having = expression.args.get("having")
+    if having:
+        yield having
+
+    qualify_ = expression.args.get("qualify")
+    if qualify_:
+        yield qualify_
+
+
+def _is_exists_condition(query: exp.Expr) -> bool:
+    """Whether a query found inside a condition is the operand of an EXISTS."""
+    parent = query.parent
+    if isinstance(parent, exp.Subquery):
+        parent = parent.parent
+    return isinstance(parent, exp.Exists)
+
+
+def _source_names(scope: Scope) -> dict[str, str]:
+    """Map a scope's derived table aliases to their `sources` keys, if marked."""
+    return {
+        dt.alias: dt.comments[0].split()[1]
+        for dt in scope.derived_tables
+        if dt.comments and dt.comments[0].startswith("source: ")
+    }
+
+
+def _trace_conditions(
+    scope: Scope,
+    upstream: Node,
+    dialect: DialectType,
+    schema: Schema,
+    source_name: str | None = None,
+    trim_selects: bool = True,
+    _cache: dict[tuple, Node] | None = None,
+    _scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None = None,
+    on_node: t.Callable[[Node], None] | None = None,
+    skip: set[tuple[str, str]] | None = None,
+) -> None:
+    """Attach the lineage of a scope's row-filtering condition columns to `upstream`.
+
+    EXISTS subqueries only contribute their own conditions, since all that matters
+    is whether a row matches; IN and scalar subqueries additionally contribute the
+    projected values they compare against, traced through to_node like any other
+    subquery in a projection.
+    """
+    expression = scope.expression
+
+    if isinstance(expression, exp.Subquery):
+        for inner_scope in scope.subquery_scopes:
+            _trace_conditions(
+                inner_scope,
+                upstream,
+                dialect=dialect,
+                schema=schema,
+                source_name=source_name,
+                trim_selects=trim_selects,
+                _cache=_cache,
+                _scope_meta=_scope_meta,
+                on_node=on_node,
+            )
+        return
+
+    if isinstance(expression, exp.SetOperation):
+        for s in scope.set_operation_scopes:
+            _trace_conditions(
+                s,
+                upstream,
+                dialect=dialect,
+                schema=schema,
+                source_name=source_name,
+                trim_selects=trim_selects,
+                _cache=_cache,
+                _scope_meta=_scope_meta,
+                on_node=on_node,
+            )
+        return
+
+    if not isinstance(expression, exp.Select):
+        return
+
+    subquery_scopes = {id(s.expression): s for s in scope.subquery_scopes}
+    seen: set[tuple[str, str]] = set(skip) if skip else set()
+
+    for condition in _condition_expressions(expression):
+        for c in find_all_in_scope(condition, exp.Column):
+            _trace_condition_column(
+                c,
+                scope,
+                upstream,
+                seen=seen,
+                dialect=dialect,
+                schema=schema,
+                source_name=source_name,
+                trim_selects=trim_selects,
+                _cache=_cache,
+                _scope_meta=_scope_meta,
+                on_node=on_node,
+            )
+
+        for query in find_all_in_scope(condition, *exp.UNWRAPPED_QUERIES):
+            subquery_scope = subquery_scopes.get(id(query))
+            if not subquery_scope:
+                logger.warning(f"Unknown subquery scope: {query.sql(dialect=dialect)}")
+                continue
+
+            if _is_exists_condition(query):
+                _trace_conditions(
+                    subquery_scope,
+                    upstream,
+                    dialect=dialect,
+                    schema=schema,
+                    source_name=source_name,
+                    trim_selects=trim_selects,
+                    _cache=_cache,
+                    _scope_meta=_scope_meta,
+                    on_node=on_node,
+                )
+            else:
+                for name in query.named_selects:
+                    to_node(
+                        name,
+                        scope=subquery_scope,
+                        dialect=dialect,
+                        upstream=upstream,
+                        trim_selects=trim_selects,
+                        schema=schema,
+                        _cache=_cache,
+                        _scope_meta=_scope_meta,
+                        on_node=on_node,
+                        include_conditions=True,
+                    )
+
+
+def _trace_condition_column(
+    c: exp.Column,
+    scope: Scope,
+    upstream: Node,
+    seen: set[tuple[str, str]],
+    dialect: DialectType,
+    schema: Schema,
+    source_name: str | None = None,
+    trim_selects: bool = True,
+    _cache: dict[tuple, Node] | None = None,
+    _scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None = None,
+    on_node: t.Callable[[Node], None] | None = None,
+) -> None:
+    """Trace a single condition column to its source, mirroring to_node's resolution.
+
+    Columns that don't belong to the scope itself are correlated references and
+    are resolved against the enclosing scopes, innermost first, so same-named
+    aliases and columns on each nesting level stay attached to their own table.
+    """
+    table = c.table
+    owning_scope = scope
+    col_source: exp.Table | Scope | None = scope.sources.get(table)
+
+    # Same single-source inference as in to_node, for columns the optimizer
+    # could not qualify (e.g. when no schema was provided).
+    if col_source is None and not table:
+        named_sources = {k: v for k, v in scope.sources.items() if k}
+        if len(named_sources) == 1:
+            table, col_source = next(iter(named_sources.items()))
+            c.set("table", exp.to_identifier(table))
+
+    if col_source is None and table:
+        ancestor = scope.parent
+        while ancestor is not None:
+            col_source = ancestor.sources.get(table)
+            if col_source is not None:
+                owning_scope = ancestor
+                break
+            ancestor = ancestor.parent
+
+    key = (table, c.name)
+    if key in seen:
+        return
+    seen.add(key)
+
+    if isinstance(col_source, Scope):
+        source_names = _source_names(owning_scope)
+        reference_node_name = None
+        if col_source.scope_type == ScopeType.DERIVED_TABLE and table not in source_names:
+            reference_node_name = table
+        elif col_source.scope_type == ScopeType.CTE:
+            selected_node, _ = owning_scope.selected_sources.get(table, (None, None))
+            reference_node_name = selected_node.name if selected_node else None
+
+        to_node(
+            c.name,
+            scope=col_source,
+            dialect=dialect,
+            scope_name=table,
+            upstream=upstream,
+            source_name=source_names.get(table) or source_name,
+            reference_node_name=reference_node_name,
+            trim_selects=trim_selects,
+            schema=schema,
+            _cache=_cache,
+            _scope_meta=_scope_meta,
+            on_node=on_node,
+            include_conditions=True,
+        )
+    else:
+        col_expr = col_source or exp.Placeholder()
+        leaf = Node(name=c.sql(comments=False), source=col_expr, expression=col_expr)
+        upstream.downstream.append(leaf)
+        if on_node:
+            on_node(leaf)
 
 
 def _pre_pivot_columns(pivot: exp.Pivot, scope: Scope, schema: Schema) -> list[str]:
