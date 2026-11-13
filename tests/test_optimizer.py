@@ -2141,6 +2141,77 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
     def test_unnest_subqueries(self):
         self.check_file("unnest_subqueries", optimizer.unnest_subqueries.unnest_subqueries)
 
+    def test_unnest_subqueries_scalar_semantics(self):
+        # A scalar subquery returns NULL for zero rows and raises for many rows. The
+        # join rewrite must preserve both behaviors instead of dropping outer rows,
+        # fanning out, or silently picking a value with MAX/ARRAY_AGG.
+        conn = duckdb.connect()
+        conn.execute(
+            """
+            CREATE TABLE orders (amount INT, customer_id INT);
+            CREATE TABLE rules (adjustment INT, enabled INT, customer_id INT);
+            INSERT INTO orders VALUES (100, 1), (200, 2), (300, 3);
+            """
+        )
+        schema = {
+            "orders": {"amount": "INT", "customer_id": "INT"},
+            "rules": {"adjustment": "INT", "enabled": "INT", "customer_id": "INT"},
+        }
+
+        queries = (
+            # uncorrelated scalar subquery used as a value
+            "SELECT o.amount + (SELECT r.adjustment FROM rules r WHERE r.enabled = 1) AS adjusted FROM orders o",
+            "SELECT COALESCE((SELECT r.adjustment FROM rules r WHERE r.enabled = 1), 0) AS adjusted FROM orders o",
+            "SELECT o.amount FROM orders o WHERE o.amount > (SELECT r.adjustment FROM rules r WHERE r.enabled = 1) OR o.amount < 0",
+            # correlated scalar subquery used as a value
+            "SELECT (SELECT r.adjustment FROM rules r WHERE r.customer_id = o.customer_id) AS adjusted FROM orders o",
+            "SELECT o.amount + (SELECT r.adjustment FROM rules r WHERE r.customer_id = o.customer_id) AS adjusted FROM orders o",
+            "SELECT o.amount FROM orders o WHERE o.amount = (SELECT r.adjustment FROM rules r WHERE r.customer_id = o.customer_id)",
+            # EXISTS only observes row counts, never selected values
+            "SELECT COUNT(*) FROM orders o HAVING EXISTS (SELECT r.adjustment FROM rules r WHERE r.enabled = 1)",
+            # aggregates provably return one row (per correlation key) and stay unnested
+            "SELECT o.amount + (SELECT SUM(r.adjustment) AS s FROM rules r WHERE r.enabled = 1) AS adjusted FROM orders o",
+            "SELECT (SELECT SUM(r.adjustment) AS s FROM rules r WHERE r.customer_id = o.customer_id) AS adjusted FROM orders o",
+            "SELECT (SELECT COUNT(*) AS c FROM rules r WHERE r.customer_id = o.customer_id) AS c FROM orders o",
+            "SELECT o.amount FROM orders o WHERE o.amount > (SELECT COUNT(*) AS c FROM rules r WHERE r.customer_id = o.customer_id)",
+        )
+
+        def execute(sql):
+            return conn.execute(sql).fetchall()
+
+        for rules_rows in (
+            [],
+            [(5, 1, 1)],
+            [(5, 1, 1), (7, 1, 1), (9, 0, 2)],
+            # equal adjustments must not replace the multiple-rows error either
+            [(5, 1, 1), (5, 1, 1)],
+            [(None, 1, 1)],
+        ):
+            conn.execute("DELETE FROM rules")
+            if rules_rows:
+                conn.executemany("INSERT INTO rules VALUES (?, ?, ?)", rules_rows)
+
+            for sql in queries:
+                with self.subTest(rules_rows=rules_rows, sql=sql):
+                    try:
+                        expected = execute(sql)
+                        error = None
+                    except duckdb.Error as e:
+                        expected = None
+                        error = e
+
+                    for rewritten in (
+                        optimizer.unnest_subqueries.unnest_subqueries(parse_one(sql)),
+                        optimizer.optimize(sql, schema=schema, dialect="duckdb"),
+                    ):
+                        rewritten_sql = rewritten.sql("duckdb")
+                        if error is not None:
+                            with self.assertRaises(duckdb.Error) as raised:
+                                execute(rewritten_sql)
+                            self.assertEqual(str(error), str(raised.exception))
+                        else:
+                            self.assertEqual(expected, execute(rewritten_sql))
+
     def test_optimize_subqueries_in_aggregates(self):
         for projection in (
             "SUM(CASE WHEN x.a = (SELECT LENGTH(w.d) FROM w WHERE w.e = 'b') THEN 1 ELSE 0 END)",

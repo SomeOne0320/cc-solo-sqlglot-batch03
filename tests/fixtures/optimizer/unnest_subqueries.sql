@@ -155,19 +155,19 @@ SELECT BIT_COUNT(EXISTS(SELECT 1 WHERE FALSE)) AS col FROM t0;
 
 # title: EXISTS in SELECT with GROUP BY - empty subquery should return 0, not eliminate rows
 SELECT EXISTS (SELECT 1 WHERE FALSE) AS ref0 FROM t1, t0 GROUP BY t0.c2;
-SELECT NOT MAX(_u_0."1") IS NULL AS ref0 FROM t1, t0 LEFT JOIN (SELECT 1 WHERE FALSE) AS _u_0 ON TRUE GROUP BY t0.c2;
+SELECT MAX(_u_0._u_1) > 0 AS ref0 FROM t1, t0 CROSS JOIN (SELECT COUNT(*) AS _u_1 FROM (SELECT 1 WHERE FALSE) AS _u_2) AS _u_0 GROUP BY t0.c2;
 
 # title: EXISTS in SELECT with GROUP BY - non-empty subquery should return 1
 SELECT EXISTS (SELECT 1 WHERE TRUE) AS ref0 FROM t1, t0 GROUP BY t0.c2;
-SELECT NOT MAX(_u_0."1") IS NULL AS ref0 FROM t1, t0 LEFT JOIN (SELECT 1 WHERE TRUE) AS _u_0 ON TRUE GROUP BY t0.c2;
+SELECT MAX(_u_0._u_1) > 0 AS ref0 FROM t1, t0 CROSS JOIN (SELECT COUNT(*) AS _u_1 FROM (SELECT 1 WHERE TRUE) AS _u_2) AS _u_0 GROUP BY t0.c2;
 
 # title: Multiple EXISTS in SELECT with GROUP BY
 SELECT EXISTS (SELECT 1 WHERE FALSE) AS ref0, EXISTS (SELECT 1 WHERE TRUE) AS ref1 FROM t1, t0 GROUP BY t0.c2;
-SELECT NOT MAX(_u_0."1") IS NULL AS ref0, NOT MAX(_u_1."1") IS NULL AS ref1 FROM t1, t0 LEFT JOIN (SELECT 1 WHERE FALSE) AS _u_0 ON TRUE LEFT JOIN (SELECT 1 WHERE TRUE) AS _u_1 ON TRUE GROUP BY t0.c2;
+SELECT MAX(_u_0._u_1) > 0 AS ref0, MAX(_u_3._u_4) > 0 AS ref1 FROM t1, t0 CROSS JOIN (SELECT COUNT(*) AS _u_1 FROM (SELECT 1 WHERE FALSE) AS _u_2) AS _u_0 CROSS JOIN (SELECT COUNT(*) AS _u_4 FROM (SELECT 1 WHERE TRUE) AS _u_5) AS _u_3 GROUP BY t0.c2;
 
 # title: EXISTS in SELECT with HAVING clause
 SELECT EXISTS (SELECT 1 WHERE FALSE) AS ref0 FROM t1 GROUP BY t1.c0 HAVING COUNT(*) > 0;
-SELECT NOT MAX(_u_0."1") IS NULL AS ref0 FROM t1 LEFT JOIN (SELECT 1 WHERE FALSE) AS _u_0 ON TRUE GROUP BY t1.c0 HAVING COUNT(*) > 0;
+SELECT MAX(_u_0._u_1) > 0 AS ref0 FROM t1 CROSS JOIN (SELECT COUNT(*) AS _u_1 FROM (SELECT 1 WHERE FALSE) AS _u_2) AS _u_0 GROUP BY t1.c0 HAVING COUNT(*) > 0;
 
 # title: Skip unnesting GENERATE_SERIES
 WITH t2 AS (SELECT CAST(t1.c1 AS BIGINT) AS ref1 FROM GENERATE_SERIES((SELECT MAX(x.a) FROM x AS x), 10, 1) AS t1(c1)) SELECT t2.ref1 AS ref1 FROM t2 AS t2;
@@ -398,7 +398,7 @@ SELECT x.b FROM x CROSS JOIN (SELECT MAX(y.b) AS b FROM y WHERE y.b = 2) AS _u_0
 # title: EXISTS inside an aggregate
 # execute: true
 SELECT SUM(CASE WHEN EXISTS(SELECT 1 AS a WHERE FALSE) THEN 1 ELSE 0 END) AS total FROM x;
-SELECT SUM(CASE WHEN NOT _u_0.a IS NULL THEN 1 ELSE 0 END) AS total FROM x LEFT JOIN (SELECT 1 AS a WHERE FALSE) AS _u_0 ON TRUE;
+SELECT SUM(CASE WHEN _u_0._u_1 > 0 THEN 1 ELSE 0 END) AS total FROM x CROSS JOIN (SELECT COUNT(*) AS _u_1 FROM (SELECT 1 AS a WHERE FALSE) AS _u_2) AS _u_0;
 
 # title: Scalar subquery outside an aggregate
 # execute: true
@@ -484,3 +484,118 @@ SELECT 1 + _u_0.n AS n FROM x CROSS JOIN (SELECT COUNT(*) AS n FROM y) AS _u_0 O
 # execute: true
 SELECT 1 + (SELECT COUNT(*) AS n FROM y) AS n FROM x WHERE EVEN(x.a) > 0;
 SELECT 1 + _u_0.n AS n FROM x CROSS JOIN (SELECT COUNT(*) AS n FROM y) AS _u_0 WHERE EVEN(x.a) > 0;
+
+# title: ungrouped aggregate scalar in arithmetic is unnested
+# execute: true
+SELECT x.a + (SELECT SUM(y.b) AS b FROM y) AS c FROM x;
+SELECT x.a + _u_0.b AS c FROM x CROSS JOIN (SELECT SUM(y.b) AS b FROM y) AS _u_0;
+
+# title: ungrouped aggregate scalar in COALESCE is unnested
+# execute: true
+SELECT COALESCE((SELECT SUM(y.b) AS b FROM y), 0) AS c FROM x;
+SELECT COALESCE(_u_0.b, 0) AS c FROM x CROSS JOIN (SELECT SUM(y.b) AS b FROM y) AS _u_0;
+
+# title: ungrouped aggregate scalar under OR is unnested
+# execute: true
+SELECT x.a FROM x WHERE x.a > (SELECT SUM(y.b) AS b FROM y) OR x.a < 0;
+SELECT x.a FROM x CROSS JOIN (SELECT SUM(y.b) AS b FROM y) AS _u_0 WHERE x.a > _u_0.b OR x.a < 0;
+
+# title: an aggregate in a window spec still makes the scalar subquery single-row
+# execute: true
+SELECT x.a > (SELECT RANK() OVER (ORDER BY SUM(y.b)) AS r FROM y) AS c FROM x;
+SELECT x.a > _u_0.r AS c FROM x CROSS JOIN (SELECT RANK() OVER (ORDER BY SUM(y.b)) AS r FROM y) AS _u_0;
+
+# title: non-aggregate scalar in arithmetic is not unnested, it can return zero or many rows
+SELECT x.a + (SELECT y.b AS b FROM y) AS c FROM x;
+SELECT x.a + (SELECT y.b AS b FROM y) AS c FROM x;
+
+# title: non-aggregate scalar in COALESCE is not unnested
+SELECT COALESCE((SELECT y.b AS b FROM y), 0) AS c FROM x;
+SELECT COALESCE((SELECT y.b AS b FROM y), 0) AS c FROM x;
+
+# title: non-aggregate scalar under OR is not unnested
+SELECT * FROM x WHERE x.a > (SELECT y.b AS b FROM y) OR x.a < 0;
+SELECT * FROM x WHERE x.a > (SELECT y.b AS b FROM y) OR x.a < 0;
+
+# title: non-aggregate scalar in WHERE is not unnested, a many-row result must keep erroring
+SELECT * FROM x WHERE x.a = (SELECT y.b AS b FROM y);
+SELECT * FROM x WHERE x.a = (SELECT y.b AS b FROM y);
+
+# title: scalar set operation is not unnested, it can return many rows
+SELECT x.a > (SELECT y.b AS b FROM y UNION ALL SELECT z.b AS b FROM z) FROM x;
+SELECT x.a > (SELECT y.b AS b FROM y UNION ALL SELECT z.b AS b FROM z) FROM x;
+
+# title: scalar aggregate with a HAVING is not unnested, it can return no rows
+# execute: true
+SELECT x.a > (SELECT SUM(y.b) AS b FROM y HAVING SUM(y.b) > 0) FROM x;
+SELECT x.a > (SELECT SUM(y.b) AS b FROM y HAVING SUM(y.b) > 0) FROM x;
+
+# title: scalar aggregate with a LIMIT is not unnested, it can return no rows
+# execute: true
+SELECT x.a > (SELECT SUM(y.b) AS b FROM y LIMIT 1) FROM x;
+SELECT x.a > (SELECT SUM(y.b) AS b FROM y LIMIT 1) FROM x;
+
+# title: scalar aggregate with a QUALIFY is not unnested, it can return no rows
+# execute: true
+SELECT x.a > (SELECT SUM(y.b) AS b FROM y QUALIFY ROW_NUMBER() OVER () = 1) FROM x;
+SELECT x.a > (SELECT SUM(y.b) AS b FROM y QUALIFY ROW_NUMBER() OVER () = 1) FROM x;
+
+# title: windowed aggregate scalar is not unnested, it returns one row per input row
+SELECT x.a > (SELECT COUNT(*) OVER () AS c FROM y) FROM x;
+SELECT x.a > (SELECT COUNT(*) OVER () AS c FROM y) FROM x;
+
+# title: grouped scalar is not unnested, it can return many rows
+SELECT x.a > (SELECT SUM(y.b) AS b FROM y GROUP BY y.c) FROM x;
+SELECT x.a > (SELECT SUM(y.b) AS b FROM y GROUP BY y.c) FROM x;
+
+# title: correlated non-aggregate scalar projection is not unnested, MAX would swallow the many-rows error
+SELECT (SELECT y.c AS c FROM y WHERE y.b = x.a) AS c FROM x;
+SELECT (SELECT y.c AS c FROM y WHERE y.b = x.a) AS c FROM x;
+
+# title: correlated non-aggregate scalar in arithmetic is not unnested
+SELECT x.a + (SELECT y.c AS c FROM y WHERE y.b = x.a) AS c FROM x;
+SELECT x.a + (SELECT y.c AS c FROM y WHERE y.b = x.a) AS c FROM x;
+
+# title: correlated non-aggregate scalar in WHERE is not unnested, ARRAY_AGG would change its type
+SELECT * FROM x WHERE x.a = (SELECT y.c AS c FROM y WHERE y.b = x.a);
+SELECT * FROM x WHERE x.a = (SELECT y.c AS c FROM y WHERE y.b = x.a);
+
+# title: correlated aggregate projection keyed on equality is unnested
+# execute: true
+SELECT (SELECT SUM(y.c) AS s FROM y WHERE y.b = x.a) AS s FROM x;
+SELECT _u_0.s AS s FROM x LEFT JOIN (SELECT SUM(y.c) AS s, y.b AS _u_1 FROM y WHERE TRUE GROUP BY y.b) AS _u_0 ON _u_0._u_1 = x.a;
+
+# title: correlated COUNT projection keyed on equality is unnested with a zero fill
+# execute: true
+SELECT (SELECT COUNT(*) AS c FROM y WHERE y.b = x.a) AS c FROM x;
+SELECT COALESCE(_u_0.c, 0) AS c FROM x LEFT JOIN (SELECT COUNT(*) AS c, y.b AS _u_1 FROM y WHERE TRUE GROUP BY y.b) AS _u_0 ON _u_0._u_1 = x.a;
+
+# title: correlated aggregate grouped by its equality key is unnested
+# execute: true
+SELECT x.a FROM x WHERE x.a = (SELECT SUM(y.c) AS s FROM y WHERE y.b = x.a GROUP BY y.b);
+SELECT x.a FROM x LEFT JOIN (SELECT SUM(y.c) AS s, y.b AS _u_1 FROM y WHERE TRUE GROUP BY y.b) AS _u_0 ON _u_0._u_1 = x.a WHERE x.a = _u_0.s;
+
+# title: correlated aggregate grouped by a non-key is not unnested, the join would fan out
+# execute: true
+SELECT * FROM x WHERE x.a = (SELECT SUM(y.c) AS s FROM y WHERE y.b = x.a GROUP BY y.c);
+SELECT * FROM x WHERE x.a = (SELECT SUM(y.c) AS s FROM y WHERE y.b = x.a GROUP BY y.c);
+
+# title: EXISTS in HAVING counts the subquery rows instead of checking a value for NULL
+# execute: true
+SELECT COUNT(*) FROM x HAVING EXISTS (SELECT y.b FROM y);
+SELECT COUNT(*) FROM x CROSS JOIN (SELECT COUNT(*) AS _u_1 FROM (SELECT y.b FROM y) AS _u_2) AS _u_0 HAVING MAX(_u_0._u_1) > 0;
+
+# title: EXISTS in HAVING with no matching rows
+# execute: true
+SELECT COUNT(*) FROM x HAVING EXISTS (SELECT y.b FROM y WHERE y.b > 100);
+SELECT COUNT(*) FROM x CROSS JOIN (SELECT COUNT(*) AS _u_1 FROM (SELECT y.b FROM y WHERE y.b > 100) AS _u_2) AS _u_0 HAVING MAX(_u_0._u_1) > 0;
+
+# title: EXISTS in HAVING over a NULL projection still sees the row
+# execute: true
+SELECT COUNT(*) FROM x HAVING EXISTS (SELECT NULL AS n);
+SELECT COUNT(*) FROM x CROSS JOIN (SELECT COUNT(*) AS _u_1 FROM (SELECT NULL AS n) AS _u_2) AS _u_0 HAVING MAX(_u_0._u_1) > 0;
+
+# title: EXISTS over a set operation in HAVING counts the wrapped rows
+# execute: true
+SELECT COUNT(*) FROM x HAVING EXISTS (SELECT y.b FROM y UNION SELECT z.b FROM z);
+SELECT COUNT(*) FROM x CROSS JOIN (SELECT COUNT(*) AS _u_2 FROM (SELECT _u_0.b AS b FROM (SELECT y.b FROM y UNION SELECT z.b FROM z) AS _u_0) AS _u_3) AS _u_1 HAVING MAX(_u_1._u_2) > 0;

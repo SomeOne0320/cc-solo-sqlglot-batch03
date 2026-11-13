@@ -15,9 +15,9 @@ def unnest_subqueries(expression: E) -> E:
 
     Example:
         >>> import sqlglot
-        >>> expression = sqlglot.parse_one("SELECT * FROM x AS x WHERE (SELECT y.a AS a FROM y AS y WHERE x.a = y.a) = 1 ")
+        >>> expression = sqlglot.parse_one("SELECT * FROM x AS x WHERE (SELECT SUM(y.a) AS a FROM y AS y WHERE x.a = y.a) = 1 ")
         >>> unnest_subqueries(expression).sql()
-        'SELECT * FROM x AS x LEFT JOIN (SELECT y.a AS a FROM y AS y WHERE TRUE GROUP BY y.a) AS _u_0 ON x.a = _u_0.a WHERE _u_0.a = 1'
+        'SELECT * FROM x AS x LEFT JOIN (SELECT SUM(y.a) AS a, y.a AS _u_1 FROM y AS y WHERE TRUE GROUP BY y.a) AS _u_0 ON x.a = _u_0._u_1 WHERE _u_0.a = 1'
 
     Args:
         expression (sqlglot.Expr): expression to unnest
@@ -112,6 +112,12 @@ def unnest(select, parent_select, next_alias_name):
     ):
         return
 
+    # The scalar branch replaces the subquery's parent node and checks where in the
+    # parent query the subquery is evaluated; capture both before a set operation is
+    # wrapped in a derived table, which detaches the wrapper from the parent query
+    target = select.parent
+    post_aggregation = _is_post_aggregation(select, parent_select)
+
     if isinstance(select, exp.SetOperation):
         inner_alias = next_alias_name()
         select = exp.select(
@@ -133,7 +139,25 @@ def unnest(select, parent_select, next_alias_name):
 
     # This subquery returns a scalar and can just be converted to a cross join
     if not isinstance(predicate, (exp.In, exp.Any)):
-        column = exp.column(select.selects[0].alias_or_name, alias)
+        if isinstance(predicate, exp.Exists):
+            # EXISTS only checks whether the subquery returns any row. Count its rows in a
+            # derived table so the joined relation always has exactly one row: the cross
+            # join can then neither drop outer rows nor fan out, and the check doesn't
+            # depend on whether the selected values happen to be NULL.
+            count_alias = next_alias_name()
+            select = exp.select(exp.alias_(exp.Count(this=exp.Star()), count_alias)).from_(
+                select.subquery(next_alias_name())
+            )
+            column = exp.column(count_alias, alias)
+        else:
+            # A scalar subquery used as a value must return exactly one row. Only an
+            # ungrouped aggregate projection guarantees that; anything else can return
+            # zero rows (a cross join would silently drop the outer rows) or multiple
+            # rows (the join would duplicate outer rows instead of raising the
+            # "scalar subquery returns multiple rows" error).
+            if not _returns_single_row(select):
+                return
+            column = exp.column(select.selects[0].alias_or_name, alias)
 
         clause_parent_select = clause.parent_select if clause else None
 
@@ -144,23 +168,16 @@ def unnest(select, parent_select, next_alias_name):
                 or any(find_in_scope(select, exp.AggFunc) for select in parent_select.selects)
             )
         ):
-            if _is_post_aggregation(select, parent_select):
+            if post_aggregation:
                 column = exp.Max(this=column)
-        elif not isinstance(select.parent, exp.Subquery):
+        elif not isinstance(target, exp.Subquery):
             return
 
-        join_type = "CROSS"
-        on_clause = None
         if isinstance(predicate, exp.Exists):
-            # If a subquery returns no rows, cross-joining against it incorrectly eliminates all rows
-            # from the parent query. Therefore, we use a LEFT JOIN that always matches (ON TRUE), then
-            # check for non-NULL column values to determine whether the subquery contained rows.
-            column = column.is_(exp.null()).not_()
-            join_type = "LEFT"
-            on_clause = exp.true()
+            column = exp.GT(this=column, expression=exp.Literal.number(0))
 
-        _replace(select.parent, column)
-        parent_select.join(select, on=on_clause, join_type=join_type, join_alias=alias, copy=False)
+        _replace(target, column)
+        parent_select.join(select, join_type="CROSS", join_alias=alias, copy=False)
 
         return
 
@@ -302,18 +319,24 @@ def decorrelate(select, parent_select, external_columns, next_alias_name):
         if find_in_scope(value, exp.Window):
             return
 
-        if find_in_scope(value, exp.AggFunc, exp.Anonymous):
-            projection = value.unalias().unnest()
-            if (
-                not value.alias
-                or len(select.selects) != 1
-                or not _is_supported_scalar_aggregate(projection)
-                or select.args.get("qualify")
-            ):
-                return
+        # A scalar subquery used as a value must return exactly one row per correlation
+        # key. Only an aggregate projection guarantees that; a plain column can come
+        # from multiple rows, and picking one with MAX or ARRAY_AGG would silently
+        # swallow the "scalar subquery returns multiple rows" error the original raises.
+        if not find_in_scope(value, exp.AggFunc, exp.Anonymous):
+            return
 
-            # Key-grouped COUNT returns scalar NULL when no group matches.
-            zero_fill = not group and isinstance(projection, exp.Count)
+        projection = value.unalias().unnest()
+        if (
+            not value.alias
+            or len(select.selects) != 1
+            or not _is_supported_scalar_aggregate(projection)
+            or select.args.get("qualify")
+        ):
+            return
+
+        # Key-grouped COUNT returns scalar NULL when no group matches.
+        zero_fill = not group and isinstance(projection, exp.Count)
 
     # Joined columns may not be grouped, so keep post-group subqueries correlated.
     parent_group = parent_select.args.get("group")
@@ -392,6 +415,17 @@ def decorrelate(select, parent_select, external_columns, next_alias_name):
             if isinstance(predicate, exp.EQ) and key not in group_by:
                 group_by.append(key)
 
+    # A GROUP BY on anything but the correlation keys can produce multiple rows per
+    # key; the join would then fan out instead of raising the multiple-rows error.
+    # EXISTS drops the GROUP BY below, so it is not affected.
+    group = select.args.get("group")
+    if (
+        group
+        and not isinstance(parent_predicate, exp.Exists)
+        and any(expression not in group_by for expression in group.expressions)
+    ):
+        return
+
     # When the subquery is embedded inside a function (e.g. COALESCE, TRIM) in the SELECT list,
     # the ancestor chain contains no Predicate node AND the subquery is not a direct projection.
     if parent_predicate is None and not is_subquery_projection:
@@ -401,15 +435,14 @@ def decorrelate(select, parent_select, external_columns, next_alias_name):
         return
 
     # if the value of the subquery is not an agg or a key, we need to collect it into an array
-    # so that it can be grouped. For subquery projections, we use a MAX aggregation instead.
-    agg_func = exp.Max if is_subquery_projection else exp.ArrayAgg
+    # so that it can be grouped
     if (
         not isinstance(value, exp.Subquery)
         and not find_in_scope(value, exp.AggFunc)
         and value.this not in group_by
     ):
         select.select(
-            exp.alias_(agg_func(this=value.this), value.alias, quoted=False),
+            exp.alias_(exp.ArrayAgg(this=value.this), value.alias, quoted=False),
             append=False,
             copy=False,
         )
@@ -553,6 +586,19 @@ def _is_plain_group(group: exp.Group) -> bool:
         isinstance(e, (exp.Rollup, exp.Cube, exp.GroupingSets))
         or (isinstance(e, exp.Tuple) and not e.expressions)
         for e in group.expressions
+    )
+
+
+def _returns_single_row(select: exp.Expr) -> bool:
+    # An ungrouped aggregate query returns exactly one row, unless HAVING, QUALIFY or
+    # a row limit can filter that row out
+    return (
+        isinstance(select, exp.Select)
+        and _has_aggregate_projection(select)
+        and not any(
+            select.args.get(arg)
+            for arg in ("group", "having", "qualify", "limit", "offset", "fetch")
+        )
     )
 
 
