@@ -46,6 +46,77 @@ class ScopeType(Enum):
     UDTF = auto()
 
 
+class _ScopeScan:
+    """
+    Results of walking a scope's expression, populated by `Scope._collect`.
+
+    These fields are only ever populated by a scan, so they're declared and initialized
+    together here. A scope holds either a complete scan or no scan at all; adding new
+    scanned information only requires a field on this class.
+    """
+
+    collected: bool
+    scans_all_subscope_columns: bool
+    raw_columns: list[exp.Column]
+    table_columns: list[exp.TableColumn]
+    stars: list[exp.Column | exp.Dot]
+    derived_tables: list[exp.Subquery]
+    udtfs: list[exp.UDTF]
+    tables: list[exp.Table]
+    ordered_sources: list[exp.Expr]
+    ctes: list[exp.CTE]
+    subqueries: list[exp.Select | exp.SetOperation]
+    join_hints: list[exp.JoinHint]
+    comprehensions: list[exp.Comprehension]
+    semi_anti_join_tables: set[str]
+    column_index: set[int]
+
+    def __init__(self) -> None:
+        self.collected = False
+        self.scans_all_subscope_columns = False
+        self.raw_columns = []
+        self.table_columns = []
+        self.stars = []
+        self.derived_tables = []
+        self.udtfs = []
+        self.tables = []
+        self.ordered_sources = []
+        self.ctes = []
+        self.subqueries = []
+        self.join_hints = []
+        self.comprehensions = []
+        self.semi_anti_join_tables = set()
+        self.column_index = set()
+
+
+class _ScopeAnswers:
+    """
+    Answers computed on demand from a scan, a scope's sources and its child scopes.
+
+    `clear_columns` only drops the column classification, which can be recomputed from
+    the existing scan. A full `Scope.clear_cache` replaces both this object and the
+    scan, so every answer is recomputed on its next read.
+    """
+
+    selected_sources: dict[str, tuple[exp.Selectable, exp.Table | Scope]] | None
+    columns: list[exp.Column] | None
+    external_columns: list[exp.Column] | None
+    local_columns: list[exp.Column] | None
+    pivots: list[exp.Pivot] | None
+    references: list[tuple[str, exp.Selectable]] | None
+
+    def __init__(self) -> None:
+        self.selected_sources = None
+        self.references = None
+        self.pivots = None
+        self.clear_columns()
+
+    def clear_columns(self) -> None:
+        self.columns = None
+        self.external_columns = None
+        self.local_columns = None
+
+
 @mypyc_attr(native_class=True)
 class Scope:
     """
@@ -79,27 +150,8 @@ class Scope:
             a list of the left and right child scopes.
     """
 
-    _collected: bool
-    _scans_all_subscope_columns: bool
-    _raw_columns: list[exp.Column]
-    _table_columns: list[exp.TableColumn]
-    _stars: list[exp.Column | exp.Dot]
-    _derived_tables: list[exp.Subquery]
-    _udtfs: list[exp.UDTF]
-    _tables: list[exp.Table]
-    _ordered_sources: list[exp.Expr]
-    _ctes: list[exp.CTE]
-    _subqueries: list[exp.Select | exp.SetOperation]
-    _join_hints: list[exp.JoinHint]
-    _comprehensions: list[exp.Comprehension]
-    _semi_anti_join_tables: set[str]
-    _column_index: set[int]
-    _selected_sources: dict[str, tuple[exp.Selectable, exp.Table | Scope]] | None
-    _columns: list[exp.Column] | None
-    _external_columns: list[exp.Column] | None
-    _local_columns: list[exp.Column] | None
-    _pivots: list[exp.Pivot] | None
-    _references: list[tuple[str, exp.Selectable]] | None
+    _scan: _ScopeScan
+    _answers: _ScopeAnswers
 
     def __init__(
         self,
@@ -132,32 +184,12 @@ class Scope:
 
     def clear_column_cache(self) -> None:
         """Invalidate the column-classification caches after columns are qualified in place."""
-        self._columns = None
-        self._external_columns = None
-        self._local_columns = None
+        self._answers.clear_columns()
 
     def clear_cache(self) -> None:
-        self._collected = False
-        self._scans_all_subscope_columns = False
-        self._raw_columns = []
-        self._table_columns = []
-        self._stars = []
-        self._derived_tables = []
-        self._udtfs = []
-        self._tables = []
-        self._ordered_sources = []
-        self._ctes = []
-        self._subqueries = []
-        self._join_hints = []
-        self._comprehensions = []
-        self._semi_anti_join_tables = set()
-        self._column_index = set()
-        self._selected_sources = None
-        self._columns = None
-        self._external_columns = None
-        self._local_columns = None
-        self._pivots = None
-        self._references = None
+        """Invalidate both the scan and every answer derived from it."""
+        self._scan = _ScopeScan()
+        self._answers = _ScopeAnswers()
 
     def branch(
         self,
@@ -182,19 +214,7 @@ class Scope:
         )
 
     def _collect(self) -> None:
-        self._tables = []
-        self._ordered_sources = []
-        self._ctes = []
-        self._subqueries = []
-        self._derived_tables = []
-        self._udtfs = []
-        self._raw_columns = []
-        self._table_columns = []
-        self._stars = []
-        self._join_hints = []
-        self._comprehensions = []
-        self._semi_anti_join_tables = set()
-        self._column_index = set()
+        scan = _ScopeScan()
 
         # The inner query of a Subquery-rooted scope is scoped as a derived table by
         # `_traverse_tables`, so it must not also be collected as a subquery
@@ -209,57 +229,58 @@ class Scope:
                 continue
 
             if isinstance(node, exp.Dot) and node.is_star:
-                self._stars.append(node)
+                scan.stars.append(node)
             elif type(node) is exp.Column:
-                self._column_index.add(id(node))
+                scan.column_index.add(id(node))
 
                 if isinstance(node.this, exp.Star):
-                    self._stars.append(node)
+                    scan.stars.append(node)
                 else:
-                    self._raw_columns.append(node)
+                    scan.raw_columns.append(node)
             elif isinstance(node, exp.Table) and not isinstance(node.parent, exp.JoinHint):
                 if _is_semi_or_anti_join_rhs(node):
-                    self._semi_anti_join_tables.add(node.alias_or_name)
+                    scan.semi_anti_join_tables.add(node.alias_or_name)
 
-                self._tables.append(node)
-                self._ordered_sources.append(node)
+                scan.tables.append(node)
+                scan.ordered_sources.append(node)
             elif isinstance(node, exp.JoinHint):
-                self._join_hints.append(node)
+                scan.join_hints.append(node)
             elif type(node) is exp.Lateral or (
                 isinstance(node, exp.UDTF) and isinstance(node.parent, (exp.From, exp.Join))
             ):
                 if _is_semi_or_anti_join_rhs(node):
-                    self._semi_anti_join_tables.add(node.alias_or_name)
+                    scan.semi_anti_join_tables.add(node.alias_or_name)
 
-                self._udtfs.append(node)
-                self._ordered_sources.append(node)
+                scan.udtfs.append(node)
+                scan.ordered_sources.append(node)
             elif isinstance(node, exp.CTE):
-                self._ctes.append(node)
+                scan.ctes.append(node)
             elif _is_derived_table(node) and _is_from_or_join(node):
                 if _is_semi_or_anti_join_rhs(node):
-                    self._semi_anti_join_tables.add(node.alias_or_name)
+                    scan.semi_anti_join_tables.add(node.alias_or_name)
 
-                self._derived_tables.append(t.cast(exp.Subquery, node))
-                self._ordered_sources.append(node)
+                scan.derived_tables.append(t.cast(exp.Subquery, node))
+                scan.ordered_sources.append(node)
             elif (
                 isinstance(node, exp.UNWRAPPED_QUERIES)
                 and not _is_from_or_join(node)
                 and node is not inner_query
             ):
-                self._subqueries.append(node)
+                scan.subqueries.append(node)
             elif isinstance(node, exp.TableColumn):
-                self._table_columns.append(node)
+                scan.table_columns.append(node)
             elif isinstance(node, exp.Comprehension):
-                self._comprehensions.append(node)
+                scan.comprehensions.append(node)
             elif isinstance(node, exp.Star) and (
                 node.args.get("except_") or not isinstance(node.parent, ROW_LEVEL_AGG_FUNCS)
             ):
-                self._scans_all_subscope_columns = True
+                scan.scans_all_subscope_columns = True
 
-        self._collected = True
+        scan.collected = True
+        self._scan = scan
 
     def _ensure_collected(self) -> None:
-        if not self._collected:
+        if not self._scan.collected:
             self._collect()
 
     def walk(self, prune: t.Callable[[exp.Expr], bool] | None = None) -> Iterator[exp.Expr]:
@@ -293,13 +314,13 @@ class Scope:
             list[exp.Table]: tables
         """
         self._ensure_collected()
-        return self._tables
+        return self._scan.tables
 
     @property
     def comprehensions(self) -> list[exp.Comprehension]:
         """List of comprehensions in this scope."""
         self._ensure_collected()
-        return self._comprehensions
+        return self._scan.comprehensions
 
     @property
     def ctes(self) -> list[exp.CTE]:
@@ -310,7 +331,7 @@ class Scope:
             list[exp.CTE]: ctes
         """
         self._ensure_collected()
-        return self._ctes
+        return self._scan.ctes
 
     @property
     def derived_tables(self) -> list[exp.Subquery]:
@@ -324,7 +345,7 @@ class Scope:
             list[exp.Subquery]: derived tables
         """
         self._ensure_collected()
-        return self._derived_tables
+        return self._scan.derived_tables
 
     @property
     def udtfs(self) -> list[exp.UDTF]:
@@ -335,7 +356,7 @@ class Scope:
             list[exp.UDTF]: UDTFs
         """
         self._ensure_collected()
-        return self._udtfs
+        return self._scan.udtfs
 
     @property
     def subqueries(self) -> list[exp.Select | exp.SetOperation]:
@@ -349,12 +370,12 @@ class Scope:
             list[exp.Select | exp.SetOperation]: subqueries
         """
         self._ensure_collected()
-        return self._subqueries
+        return self._scan.subqueries
 
     @property
     def scans_all_subscope_columns(self) -> bool:
         self._ensure_collected()
-        return self._scans_all_subscope_columns
+        return self._scan.scans_all_subscope_columns
 
     @property
     def stars(self) -> list[exp.Column | exp.Dot]:
@@ -362,7 +383,7 @@ class Scope:
         List of star expressions (columns or dots) in this scope.
         """
         self._ensure_collected()
-        return self._stars
+        return self._scan.stars
 
     @property
     def column_index(self) -> set[int]:
@@ -370,7 +391,7 @@ class Scope:
         Set of column object IDs that belong to this scope's expression.
         """
         self._ensure_collected()
-        return self._column_index
+        return self._scan.column_index
 
     @property
     def columns(self) -> list[exp.Column]:
@@ -381,9 +402,9 @@ class Scope:
             list[exp.Column]: Column instances in this scope, plus any
                 Columns that reference this scope from correlated subqueries.
         """
-        if self._columns is None:
+        if self._answers.columns is None:
             self._ensure_collected()
-            columns = self._raw_columns
+            columns = self._scan.raw_columns
 
             external_columns = [
                 column
@@ -398,7 +419,7 @@ class Scope:
             expr = self.expression
             named_selects = set(expr.named_selects) if isinstance(expr, exp.Query) else set()
 
-            self._columns = []
+            self._answers.columns = []
             for column in columns + external_columns:
                 ancestor = column.find_ancestor(
                     exp.Select,
@@ -426,14 +447,14 @@ class Scope:
                     )
                     or (isinstance(ancestor, exp.Star) and not column.arg_key == "except_")
                 ):
-                    self._columns.append(column)
+                    self._answers.columns.append(column)
 
-        return self._columns
+        return self._answers.columns
 
     @property
     def table_columns(self) -> list[exp.TableColumn]:
         self._ensure_collected()
-        return self._table_columns
+        return self._scan.table_columns
 
     @property
     def selected_sources(self) -> dict[str, tuple[exp.Selectable, exp.Table | Scope]]:
@@ -446,11 +467,11 @@ class Scope:
         Returns:
             dict[str, (exp.Table|exp.Select, exp.Table|Scope)]: selected sources and nodes
         """
-        if self._selected_sources is None:
+        if self._answers.selected_sources is None:
             result: dict[str, tuple[exp.Selectable, exp.Table | Scope]] = {}
 
             for name, node in self.references:
-                if name in self._semi_anti_join_tables:
+                if name in self._scan.semi_anti_join_tables:
                     # The RHS table of SEMI/ANTI joins shouldn't be collected as a
                     # selected source
                     continue
@@ -460,21 +481,21 @@ class Scope:
                 if name in self.sources:
                     result[name] = (node, self.sources[name])
 
-            self._selected_sources = result
-        return self._selected_sources
+            self._answers.selected_sources = result
+        return self._answers.selected_sources
 
     @property
     def references(self) -> list[tuple[str, exp.Selectable]]:
-        if self._references is None:
+        if self._answers.references is None:
             self._ensure_collected()
-            self._references = []
+            self._answers.references = []
 
             # Sources are kept in walk order, which star expansion relies on
-            for expression in self._ordered_sources:
+            for expression in self._scan.ordered_sources:
                 if isinstance(expression, exp.Table):
-                    self._references.append((expression.alias_or_name, expression))
+                    self._answers.references.append((expression.alias_or_name, expression))
                 else:
-                    self._references.append(
+                    self._answers.references.append(
                         (
                             _get_source_alias(expression),
                             (
@@ -483,7 +504,7 @@ class Scope:
                         )
                     )
 
-        return self._references
+        return self._answers.references
 
     @property
     def external_columns(self) -> list[exp.Column]:
@@ -493,20 +514,20 @@ class Scope:
         Returns:
             list[exp.Column]: Column instances that don't reference sources in the current scope.
         """
-        if self._external_columns is None:
+        if self._answers.external_columns is None:
             if isinstance(self.expression, exp.SetOperation):
                 left, right = self.set_operation_scopes
-                self._external_columns = left.external_columns + right.external_columns
+                self._answers.external_columns = left.external_columns + right.external_columns
             else:
                 local_source_names = {name for name, _ in self.references}
-                self._external_columns = [
+                self._answers.external_columns = [
                     c
                     for c in self.columns
                     if c.text("table") not in local_source_names
                     and c.text("table") not in self.semi_or_anti_join_tables
                 ]
 
-        return self._external_columns
+        return self._answers.external_columns
 
     @property
     def local_columns(self) -> list[exp.Column]:
@@ -516,13 +537,15 @@ class Scope:
         Returns:
             list[exp.Column]: Column instances that reference sources in the current scope.
         """
-        if self._local_columns is None:
+        if self._answers.local_columns is None:
             # Compare nodes by identity: structural equality would conflate distinct
             # column nodes that happen to look the same, and is much more expensive.
             external_column_ids = {id(c) for c in self.external_columns}
-            self._local_columns = [c for c in self.columns if id(c) not in external_column_ids]
+            self._answers.local_columns = [
+                c for c in self.columns if id(c) not in external_column_ids
+            ]
 
-        return self._local_columns
+        return self._answers.local_columns
 
     @property
     def unqualified_columns(self) -> list[exp.Column]:
@@ -543,21 +566,21 @@ class Scope:
             list[exp.JoinHint]: Join hints that are referenced within the scope
         """
         self._ensure_collected()
-        return self._join_hints
+        return self._scan.join_hints
 
     @property
     def pivots(self) -> list[exp.Pivot]:
-        if self._pivots is None:
-            self._pivots = [
+        if self._answers.pivots is None:
+            self._answers.pivots = [
                 pivot for _, node in self.references for pivot in node.args.get("pivots") or []
             ]
 
-        return self._pivots
+        return self._answers.pivots
 
     @property
     def semi_or_anti_join_tables(self) -> set[str]:
         self._ensure_collected()
-        return self._semi_anti_join_tables
+        return self._scan.semi_anti_join_tables
 
     def source_columns(self, source_name: str) -> list[exp.Column]:
         """
@@ -660,7 +683,7 @@ class Scope:
             for _, source in scope.selected_sources.values():
                 scope_ref_count[id(source)] += 1
 
-            for name in scope._semi_anti_join_tables:
+            for name in scope._scan.semi_anti_join_tables:
                 # semi/anti join sources are not actually selected but we still need to
                 # increment their ref count to avoid them being optimized away
                 if name in scope.sources:

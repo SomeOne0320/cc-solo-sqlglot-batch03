@@ -20,7 +20,8 @@ from sqlglot.optimizer.journal import record, revert
 from sqlglot.optimizer.normalize import normalization_distance
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.resolver import Resolver
-from sqlglot.optimizer.scope import build_scope, traverse_scope, walk_in_scope
+from sqlglot.lineage import lineage
+from sqlglot.optimizer.scope import Scope, build_scope, traverse_scope, walk_in_scope
 from sqlglot.schema import MappingSchema
 from tests.helpers import (
     TPCDS_SCHEMA,
@@ -3011,6 +3012,215 @@ SELECT :with_,WITH :expressions,CTE :this,UNION :this,SELECT :expressions,1,:exp
         subquery_scope = next(s for s in scopes if s.is_subquery)
         self.assertTrue(subquery_scope.is_correlated_subquery)
         self.assertIn("x.id", [c.sql() for c in subquery_scope.external_columns])
+
+    def test_scope_cache_lifecycle(self):
+        # Build the scope directly so that no traversal has read from it yet. The source
+        # must be registered explicitly, since `Scope` doesn't derive it from the expression
+        expression = parse_one("SELECT x.a, x.b + 1 AS c FROM x WHERE x.a > 1")
+        scope = Scope(expression, sources={"x": expression.find(exp.Table)})
+        columns = ["x.a", "x.b", "x.a"]
+
+        def scan_count():
+            # A scan populates every list at once, so observing it through `tables`
+            # is enough to know whether the scope walked its expression again.
+            scope.tables
+            return collect.call_count
+
+        with patch.object(Scope, "_collect", autospec=True, side_effect=Scope._collect) as collect:
+            # The scan is deferred until a scanned value is actually read
+            self.assertEqual(collect.call_count, 0)
+
+            self.assertEqual([t.sql() for t in scope.tables], ["x"])
+            self.assertEqual(scan_count(), 1)
+
+            # Answers are derived from the existing scan
+            self.assertEqual([c.sql() for c in scope.columns], columns)
+            self.assertEqual([c.sql() for c in scope.external_columns], [])
+            self.assertEqual(list(scope.selected_sources), ["x"])
+            self.assertEqual([n for n, _ in scope.references], ["x"])
+            self.assertEqual(scan_count(), 1)
+
+            # A partial clear keeps the scan and only drops the column classification
+            cached_columns = scope.columns
+            scope.clear_column_cache()
+            self.assertEqual([c.sql() for c in scope.columns], columns)
+            self.assertIsNot(scope.columns, cached_columns)
+            self.assertEqual(scan_count(), 1)
+
+            # A full clear discards both, but the next read scans exactly once even
+            # when several different answers are requested in a row
+            scope.clear_cache()
+            self.assertEqual(collect.call_count, 1)
+            self.assertEqual([c.sql() for c in scope.columns], columns)
+            self.assertEqual([t.sql() for t in scope.tables], ["x"])
+            self.assertEqual([c.sql() for c in scope.local_columns], columns)
+            self.assertEqual(list(scope.selected_sources), ["x"])
+            self.assertEqual([n for n, _ in scope.references], ["x"])
+            self.assertEqual(scope.pivots, [])
+            self.assertEqual(scan_count(), 2)
+
+            # Alternating partial clears doesn't rescan either
+            scope.clear_column_cache()
+            self.assertEqual([c.sql() for c in scope.external_columns], [])
+            scope.clear_column_cache()
+            self.assertEqual([c.sql() for c in scope.local_columns], columns)
+            self.assertEqual(scan_count(), 2)
+
+    def test_scope_state_keeps_original_nodes_and_order(self):
+        expression = parse_one("SELECT a, b, c FROM x")
+        scope = build_scope(expression)
+        ast_columns = list(expression.find_all(exp.Column))
+
+        self.assertEqual(len(scope.columns), len(ast_columns))
+        for expected, actual in zip(ast_columns, scope.columns):
+            self.assertIs(expected, actual)
+        self.assertIs(scope.columns, scope.columns)
+
+        # Re-reading after a partial clear preserves node identity and order as well
+        scope.clear_column_cache()
+        self.assertEqual(len(scope.columns), len(ast_columns))
+        for expected, actual in zip(ast_columns, scope.columns):
+            self.assertIs(expected, actual)
+
+        scope.clear_cache()
+        for expected, actual in zip(ast_columns, scope.columns):
+            self.assertIs(expected, actual)
+
+    def test_scope_partial_clear_reclassifies_columns(self):
+        expression = parse_one("SELECT (SELECT MAX(a) FROM y) AS m FROM x")
+        subquery = next(s for s in traverse_scope(expression) if s.is_subquery)
+
+        with patch.object(Scope, "_collect", autospec=True, side_effect=Scope._collect) as collect:
+            self.assertEqual([c.sql() for c in subquery.columns], ["a"])
+            self.assertEqual([c.sql() for c in subquery.external_columns], ["a"])
+            self.assertEqual(subquery.local_columns, [])
+            scans = collect.call_count
+
+            # Qualifying the column in place changes which source it references
+            column = subquery.columns[0]
+            column.set("table", exp.to_identifier("y"))
+            subquery.clear_column_cache()
+
+        self.assertEqual([c.sql() for c in subquery.external_columns], [])
+        self.assertEqual([c.sql() for c in subquery.local_columns], ["y.a"])
+        self.assertIs(subquery.columns[0], column)
+
+        # The scan was reused: reclassifying doesn't walk the expression again
+        self.assertEqual(collect.call_count, scans)
+
+    def test_scope_state_nested_queries(self):
+        # The inner subquery references the outer derived table, while the CTE and the
+        # derived table share the name `t` across levels
+        sql = """
+        WITH t AS (SELECT x.id AS id, x.a AS a FROM x)
+        SELECT (SELECT MAX(t2.a) FROM t AS t2 WHERE t2.id = t.id) AS m
+        FROM (SELECT id FROM t) AS t
+        """
+        expression = parse_one(sql)
+        scopes = traverse_scope(expression)
+        cte_scope = next(s for s in scopes if s.is_cte)
+        derived_scope = next(s for s in scopes if s.is_derived_table)
+        subquery_scope = next(s for s in scopes if s.is_subquery)
+        root_scope = scopes[-1]
+
+        # Each level binds `t` to the source visible at that level
+        self.assertIs(root_scope.sources["t"], derived_scope)
+        self.assertIs(derived_scope.sources["t"], cte_scope)
+        self.assertIs(subquery_scope.sources["t"], cte_scope)
+        self.assertIs(subquery_scope.sources["t2"], cte_scope)
+
+        self.assertEqual([c.sql() for c in cte_scope.columns], ["x.id", "x.a"])
+        self.assertEqual(cte_scope.external_columns, [])
+        self.assertEqual([c.sql() for c in derived_scope.columns], ["id"])
+        self.assertEqual([c.sql() for c in derived_scope.external_columns], ["id"])
+        self.assertEqual([c.sql() for c in subquery_scope.external_columns], ["t.id"])
+        self.assertEqual([c.sql() for c in subquery_scope.local_columns], ["t2.a", "t2.id"])
+        self.assertTrue(subquery_scope.is_correlated_subquery)
+        self.assertEqual([c.sql() for c in root_scope.columns], ["t.id"])
+        self.assertEqual(root_scope.external_columns, [])
+        self.assertEqual(list(root_scope.selected_sources), ["t"])
+
+        # Lineage follows the same bindings through the rewritten query
+        node = lineage("m", sql, schema={"x": {"id": "int", "a": "int"}})
+        self.assertEqual(
+            node.source.sql(),
+            "WITH t AS (SELECT x.id AS id, x.a AS a FROM x AS x) "
+            "SELECT (SELECT MAX(t2.a) AS _col_0 FROM t AS t2 WHERE t2.id = t.id) AS m "
+            "FROM (SELECT t.id AS id FROM t AS t) AS t",
+        )
+        downstream = node.downstream[0]
+        self.assertEqual(downstream.source_name, "")
+        self.assertEqual(
+            downstream.source.sql(),
+            "SELECT MAX(t2.a) AS _col_0 FROM t AS t2 WHERE t2.id = t.id",
+        )
+
+    def test_scope_state_ordered_sources(self):
+        sql = (
+            "SELECT u2.v AS out FROM a JOIN b ON b.id = a.id "
+            "LEFT JOIN UNNEST(b.arr) AS u1 LEFT JOIN UNNEST(u1.a) AS u2"
+        )
+        scope = build_scope(parse_one(sql, read="bigquery"))
+
+        # Tables and laterals stay in FROM/JOIN order, and each lateral sees the
+        # sources defined before it
+        self.assertEqual([t.alias_or_name for t in scope.tables], ["a", "b"])
+        self.assertEqual(
+            [u.sql() for u in scope.udtfs],
+            [
+                "UNNEST(b.arr) AS _t0(u1)",
+                "UNNEST(u1.a) AS _t0(u2)",
+            ],
+        )
+        self.assertEqual([name for name, _ in scope.references], ["a", "b", "u1", "u2"])
+        self.assertIsInstance(scope.sources["u1"], Scope)
+        self.assertIsInstance(scope.sources["u2"], Scope)
+        self.assertEqual(list(scope.selected_sources), ["a", "b", "u1", "u2"])
+
+        u1_scope, u2_scope = scope.table_scopes
+        self.assertEqual(list(u1_scope.sources), ["a", "b"])
+        self.assertEqual(list(u2_scope.sources), ["a", "b", "u1"])
+        self.assertEqual([c.sql() for c in u1_scope.external_columns], ["b.arr"])
+        self.assertEqual([c.sql() for c in u2_scope.external_columns], ["u1.a"])
+
+        self.assertEqual(
+            qualify(
+                parse_one(sql, read="bigquery"),
+                schema={
+                    "a": {"id": "int", "arr": "ARRAY<STRUCT<a ARRAY<INT>>>"},
+                    "b": {"id": "int", "arr": "ARRAY<STRUCT<a ARRAY<INT>>>"},
+                },
+                identify=False,
+            ).sql(dialect="bigquery"),
+            "SELECT u2.v AS out FROM a AS a JOIN b AS b ON b.id = a.id "
+            "LEFT JOIN UNNEST(b.arr) AS u1 LEFT JOIN UNNEST(u1.a) AS u2",
+        )
+
+    def test_scope_source_updates(self):
+        scope = build_scope(parse_one("SELECT a FROM x"))
+        self.assertEqual([t.sql() for t in scope.tables], ["x"])
+        self.assertEqual(list(scope.selected_sources), ["x"])
+
+        # Replacing an expression through the scope invalidates the scan, but the
+        # sources are only rebound through the explicit source methods
+        scope.replace(scope.find(exp.Table), exp.to_table("y"))
+        self.assertEqual([t.sql() for t in scope.tables], ["y"])
+        self.assertEqual(list(scope.selected_sources), [])
+
+        scope.remove_source("x")
+        self.assertEqual(list(scope.sources), [])
+        self.assertEqual(list(scope.selected_sources), [])
+
+        scope.add_source("y", exp.to_table("y"))
+        self.assertEqual(list(scope.selected_sources), ["y"])
+
+        # Renaming a source updates the mapping; the scan is unaffected
+        renamed = build_scope(parse_one("SELECT a FROM x AS y"))
+        renamed.find(exp.Table).set("alias", exp.TableAlias(this=exp.to_identifier("z")))
+        renamed.rename_source("y", "z")
+        self.assertEqual(list(renamed.sources), ["z"])
+        self.assertEqual(list(renamed.references), [("z", renamed.find(exp.Table))])
+        self.assertEqual(list(renamed.selected_sources), ["z"])
 
     @patch("sqlglot.optimizer.scope.logger")
     def test_scope_warning(self, logger):
