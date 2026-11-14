@@ -196,7 +196,12 @@ class ChangeDistiller:
         self._unmatched_target_nodes = set(self._target_index) - set(pre_matched_nodes.values())
         self._bigram_histo_cache: dict[int, defaultdict[str, int]] = {}
 
-        matching_set = self._compute_matching_set() | set(pre_matched_nodes.items())
+        # If the caller's matchings already cover every node on either side, no further
+        # matching work is possible, so the quadratic matching pass is skipped entirely.
+        if self._unmatched_source_nodes and self._unmatched_target_nodes:
+            matching_set = self._compute_matching_set() | set(pre_matched_nodes.items())
+        else:
+            matching_set = set(pre_matched_nodes.items())
         return self._generate_edit_script(dict(matching_set), delta_only)
 
     def _generate_edit_script(self, matchings: dict[int, int], delta_only: bool) -> list[Edit]:
@@ -260,9 +265,7 @@ class ChangeDistiller:
         source_args = [id(e) for e in _expression_only_args(source)]
         target_args = [id(e) for e in _expression_only_args(target)]
 
-        args_lcs = set(
-            _lcs(source_args, target_args, lambda l, r: matchings.get(t.cast(int, l)) == r)
-        )
+        args_lcs = set(_lcs(source_args, target_args, lambda l, r: matchings.get(l) == r))
 
         move_edits = []
         for a in source_args:
@@ -338,8 +341,19 @@ class ChangeDistiller:
 
     def _compute_leaf_matching_set(self) -> set[tuple[int, int]]:
         candidate_matchings: list[tuple[float, int, int, exp.Expr, exp.Expr]] = []
-        source_expression_leaves = list(_get_expression_leaves(self._source))
-        target_expression_leaves = list(_get_expression_leaves(self._target))
+        # Leaves that are already matched (e.g. pre-matched by the caller) can never be
+        # picked below, so they're excluded upfront instead of being pairwise compared
+        # against every leaf of the other tree only to be discarded.
+        source_expression_leaves = [
+            leaf
+            for leaf in _get_expression_leaves(self._source)
+            if id(leaf) in self._unmatched_source_nodes
+        ]
+        target_expression_leaves = [
+            leaf
+            for leaf in _get_expression_leaves(self._target)
+            if id(leaf) in self._unmatched_target_nodes
+        ]
         for source_leaf in source_expression_leaves:
             for target_leaf in target_expression_leaves:
                 if _is_same_type(source_leaf, target_leaf):
@@ -454,23 +468,77 @@ def _expression_only_args(expression: exp.Expr) -> Iterator[exp.Expr]:
 def _lcs(
     seq_a: Sequence[T], seq_b: Sequence[T], equal: t.Callable[[T, T], bool]
 ) -> Sequence[T | None]:
-    """Calculates the longest common subsequence"""
+    """Calculates the longest common subsequence.
 
+    This is Hirschberg's divide-and-conquer algorithm, so the temporary memory stays
+    linear in the sequence lengths instead of quadratic for the full dynamic
+    programming table. Each split uses the smallest column that maximizes the combined
+    length, which reproduces the classic algorithm's exact tie-breaking (match equal
+    elements whenever possible, otherwise prefer dropping an element of seq_b), so the
+    returned subsequence is identical to the one the quadratic-space version produced.
+    """
     len_a = len(seq_a)
     len_b = len(seq_b)
-    lcs_result = [[None] * (len_b + 1) for i in range(len_a + 1)]
 
-    for i in range(len_a + 1):
-        for j in range(len_b + 1):
-            if i == 0 or j == 0:
-                lcs_result[i][j] = []  # type: ignore
-            elif equal(seq_a[i - 1], seq_b[j - 1]):
-                lcs_result[i][j] = lcs_result[i - 1][j - 1] + [seq_a[i - 1]]  # type: ignore
+    if not len_a or not len_b:
+        return []
+    if len_a == 1:
+        item = seq_a[0]
+        return [item] if any(equal(item, other) for other in seq_b) else []
+
+    mid = len_a // 2
+    split = _lcs_split_column(seq_a, seq_b, equal, mid)
+
+    return [
+        *_lcs(seq_a[:mid], seq_b[:split], equal),
+        *_lcs(seq_a[mid:], seq_b[split:], equal),
+    ]
+
+
+def _lcs_split_column(
+    seq_a: Sequence[T], seq_b: Sequence[T], equal: t.Callable[[T, T], bool], mid: int
+) -> int:
+    """Returns the smallest column k maximizing the LCS lengths of the two halves.
+
+    Computed with two single-row passes (the second one over the reversed sequences),
+    so the auxiliary memory is O(len(seq_b)) and is released before the caller
+    recurses into the halves.
+    """
+    forward = _lcs_lengths(seq_a[:mid], seq_b, equal)
+    backward = _lcs_lengths(seq_a[mid:][::-1], seq_b[::-1], equal)
+
+    len_b = len(seq_b)
+    split = 0
+    best_score = forward[0] + backward[len_b]
+    for k in range(1, len_b + 1):
+        score = forward[k] + backward[len_b - k]
+        if score > best_score:
+            best_score = score
+            split = k
+
+    return split
+
+
+def _lcs_lengths(
+    seq_a: Sequence[T], seq_b: Sequence[T], equal: t.Callable[[T, T], bool]
+) -> list[int]:
+    """Returns the LCS lengths between seq_a and every prefix of seq_b.
+
+    Only two rows of the dynamic programming table are kept at a time, so this uses
+    O(len(seq_b)) auxiliary space.
+    """
+    len_b = len(seq_b)
+    previous = [0] * (len_b + 1)
+    for a_item in seq_a:
+        current = [0]
+        append = current.append
+        for j, b_item in enumerate(seq_b):
+            if equal(a_item, b_item):
+                append(previous[j] + 1)
             else:
-                lcs_result[i][j] = (
-                    lcs_result[i - 1][j]
-                    if len(lcs_result[i - 1][j]) > len(lcs_result[i][j - 1])  # type: ignore
-                    else lcs_result[i][j - 1]
-                )
+                up = previous[j + 1]
+                left = current[j]
+                append(up if up >= left else left)
+        previous = current
 
-    return lcs_result[len_a][len_b]  # type: ignore
+    return previous

@@ -1,7 +1,10 @@
+import gc
+import tracemalloc
 import unittest
+from unittest import mock
 
 from sqlglot import exp, parse_one
-from sqlglot.diff import Insert, Move, Remove, Update, diff
+from sqlglot.diff import ChangeDistiller, Insert, Keep, Move, Remove, Update, _lcs, diff
 
 
 def diff_delta_only(source, target, matchings=None, **kwargs):
@@ -9,11 +12,47 @@ def diff_delta_only(source, target, matchings=None, **kwargs):
 
 
 def _edit_sql(edit):
-    if isinstance(edit, Move):
-        return (edit.source.sql(), edit.target.sql())
-    if isinstance(edit, Update):
+    if isinstance(edit, (Keep, Move, Update)):
         return (edit.source.sql(), edit.target.sql())
     return edit.expression.sql()
+
+
+def _edit_signature(edit):
+    return (type(edit).__name__, *_edit_sql(edit))
+
+
+def _prematch_all(source, target):
+    """Pairs up every node the diff algorithm can see.
+
+    Stands in for a caller that has already confirmed the correspondence between two
+    versions of a report: the two roots are versions of the same query, and every
+    other node pairs up by its unique (type, sql) key. Identifiers are ignored by
+    the diff algorithm, so they are left out.
+    """
+
+    def index(root):
+        by_key = {}
+        for node in root.walk():
+            if not isinstance(node, exp.Identifier):
+                by_key.setdefault((type(node), node.sql()), []).append(node)
+        return by_key
+
+    source_index = index(source)
+    target_index = index(target)
+
+    matchings = [(source, target)]
+    for key, source_nodes in source_index.items():
+        target_nodes = target_index.get(key)
+        if len(source_nodes) == 1 and target_nodes and len(target_nodes) == 1:
+            matchings.append((source_nodes[0], target_nodes[0]))
+    return matchings
+
+
+def _moved_column_report(ncols):
+    """Two versions of a wide report where only the last column moved to the front."""
+    source_sql = "SELECT " + ", ".join(f"c{i}" for i in range(ncols)) + " FROM t"
+    target_sql = f"SELECT c{ncols - 1}, " + ", ".join(f"c{i}" for i in range(ncols - 1)) + " FROM t"
+    return parse_one(source_sql), parse_one(target_sql)
 
 
 class TestDiff(unittest.TestCase):
@@ -397,6 +436,180 @@ class TestDiff(unittest.TestCase):
 
         self.assertEqual(expr_tgt.args["from_"].this.comments, [" this is comment"])
         self._validate_delta_only(diff_delta_only(expr_src, expr_tgt), [])
+
+    def test_fully_prematched_report_rewrite(self):
+        # A report rewrite that only moved the last column to the front, with the
+        # caller confirming every node correspondence upfront. The diff must remain
+        # a single Move (not a cascade of Removes/Inserts), and the edit script must
+        # come out exactly as it did before the matching fast path was introduced.
+        source, target = _moved_column_report(5)
+        matchings = _prematch_all(source, target)
+
+        self.assertEqual(
+            [_edit_signature(e) for e in diff(source, target, matchings=matchings)],
+            [
+                ("Move", "c4", "c4"),
+                (
+                    "Keep",
+                    "SELECT c0, c1, c2, c3, c4 FROM t",
+                    "SELECT c4, c0, c1, c2, c3 FROM t",
+                ),
+                ("Keep", "c0", "c0"),
+                ("Keep", "c1", "c1"),
+                ("Keep", "c2", "c2"),
+                ("Keep", "c3", "c3"),
+                ("Keep", "c4", "c4"),
+                ("Keep", "FROM t", "FROM t"),
+                ("Keep", "t", "t"),
+            ],
+        )
+
+        self.assertEqual(
+            [_edit_signature(e) for e in diff_delta_only(source, target, matchings=matchings)],
+            [("Move", "c4", "c4")],
+        )
+
+        # same guarantee at a larger width: one moved column stays one Move
+        source, target = _moved_column_report(200)
+        edits = diff_delta_only(source, target, matchings=_prematch_all(source, target))
+        self.assertEqual([_edit_signature(e) for e in edits], [("Move", "c199", "c199")])
+
+    def test_fully_prematched_nodes_are_not_recompared(self):
+        # Once the caller has confirmed every correspondence, no node pair may be
+        # compared again: the quadratic matching pass must not run at all.
+        source, target = _moved_column_report(20)
+        matchings = _prematch_all(source, target)
+
+        with mock.patch.object(
+            ChangeDistiller, "_compute_matching_set", autospec=True
+        ) as matching_spy:
+            diff(source, target, matchings=matchings)
+            matching_spy.assert_not_called()
+
+        with mock.patch.object(ChangeDistiller, "_dice_coefficient", autospec=True) as dice_spy:
+            diff(source, target, matchings=matchings)
+            dice_spy.assert_not_called()
+
+        # partial or absent correspondences still trigger matching for the rest
+        with mock.patch.object(
+            ChangeDistiller, "_compute_matching_set", autospec=True
+        ) as matching_spy:
+            diff(source, target, matchings=matchings[:1])
+            self.assertEqual(matching_spy.call_count, 1)
+            diff(source, target)
+            self.assertEqual(matching_spy.call_count, 2)
+
+    def test_fully_prematched_memory_scales_linearly(self):
+        # The temporary memory of a fully pre-matched comparison must scale linearly:
+        # doubling the report width should roughly double the peak, not quadruple it
+        # (the previous implementation grew ~3.4x per doubling here).
+        def peak_bytes_and_edits(ncols):
+            source, target = _moved_column_report(ncols)
+            matchings = _prematch_all(source, target)
+
+            gc.collect()
+            tracemalloc.start()
+            edits = diff(source, target, matchings=matchings, delta_only=True)
+            _, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            return peak, edits
+
+        peak_small, edits_small = peak_bytes_and_edits(512)
+        peak_large, edits_large = peak_bytes_and_edits(1024)
+
+        # the memory saving must not come from checking fewer changes
+        self.assertEqual([_edit_signature(e) for e in edits_small], [("Move", "c511", "c511")])
+        self.assertEqual([_edit_signature(e) for e in edits_large], [("Move", "c1023", "c1023")])
+        self.assertLess(peak_large / peak_small, 2.7)
+
+    def test_lcs_tie_breaks(self):
+        # When several longest common subsequences are equally reasonable, the choice
+        # must stay the one the original quadratic-space implementation made.
+        self.assertEqual(_lcs(list("BA"), list("AB"), lambda l, r: l == r), ["A"])
+        self.assertEqual(_lcs(list("AB"), list("BA"), lambda l, r: l == r), ["B"])
+        self.assertEqual(_lcs(list("ABCBA"), list("BACAB"), lambda l, r: l == r), ["B", "C", "A"])
+        self.assertEqual(
+            _lcs(list("ABCBDAB"), list("BDCABA"), lambda l, r: l == r), ["B", "D", "A", "B"]
+        )
+        self.assertEqual(
+            _lcs(["a", "b", "a", "b"], ["b", "a", "b", "a"], lambda l, r: l == r),
+            ["b", "a", "b"],
+        )
+        self.assertEqual(_lcs([1, 2, 3, 4, 5], [5, 1, 2, 3, 4], lambda l, r: l == r), [1, 2, 3, 4])
+        self.assertEqual(_lcs([1, 2, 3, 4, 5], [2, 3, 4, 5, 1], lambda l, r: l == r), [2, 3, 4, 5])
+
+        # edge cases
+        self.assertEqual(_lcs([], [1, 2], lambda l, r: l == r), [])
+        self.assertEqual(_lcs([1, 2], [], lambda l, r: l == r), [])
+        self.assertEqual(_lcs([1], [1, 1, 1], lambda l, r: l == r), [1])
+        self.assertEqual(_lcs([1, 1, 1], [1], lambda l, r: l == r), [1])
+        self.assertEqual(_lcs([1, 2, 3], [4, 5, 6], lambda l, r: l == r), [])
+
+        # custom equality rules keep working (id-based matching, as used for move edits)
+        matching = {10: 10, 20: 20, 30: 30, 40: 40}
+        self.assertEqual(
+            _lcs([10, 20, 30, 40], [40, 10, 20, 30], lambda l, r: matching.get(l) == r),
+            [10, 20, 30],
+        )
+        self.assertEqual(
+            _lcs([10, 20, 30, 40], [10, 30, 20, 40], lambda l, r: matching.get(l) == r),
+            [10, 30, 40],
+        )
+
+    def test_prematched_duplicate_column_names(self):
+        # Reports may contain same-named columns; caller-confirmed correspondences
+        # (here: positional) must still be honored.
+        source = parse_one("SELECT a, a, b, a FROM t")
+        target = parse_one("SELECT a, b, a, a FROM t")
+        source_columns = [n for n in source.walk() if isinstance(n, exp.Column)]
+        target_columns = [n for n in target.walk() if isinstance(n, exp.Column)]
+        matchings = [(source, target), *zip(source_columns, target_columns)]
+
+        self._validate_delta_only(
+            diff_delta_only(source, target, matchings=matchings),
+            [
+                Update(source=exp.column("a"), target=exp.column("b")),
+                Update(source=exp.column("b"), target=exp.column("a")),
+            ],
+        )
+
+    def test_prematched_shared_nodes(self):
+        # The two versions may reuse the same node objects, forcing the diff to work
+        # on copies; the input trees must be left intact.
+        shared = parse_one("SELECT x, y FROM s")
+        source = parse_one("SELECT a, b FROM t")
+        target = source.copy()
+        target.args["from_"] = shared.args["from_"]
+
+        matchings = _prematch_all(source, target)
+        self._validate_delta_only(
+            diff_delta_only(source, target, matchings=matchings),
+            [
+                Remove(expression=parse_one("SELECT 1 FROM t").args["from_"]),
+                Remove(expression=exp.to_table("t", quoted=False)),
+                Insert(expression=parse_one("SELECT 1 FROM s").args["from_"]),
+                Insert(expression=exp.to_table("s", quoted=False)),
+            ],
+        )
+
+        self.assertEqual(source.sql(), "SELECT a, b FROM t")
+        self.assertEqual(target.sql(), "SELECT a, b FROM s")
+
+    def test_prematched_rediff_after_mutation(self):
+        # Comparing the same input again after modifying it must not carry over
+        # any state from the previous run.
+        source, target = _moved_column_report(5)
+        matchings = _prematch_all(source, target)
+
+        first = diff_delta_only(source, target, matchings=matchings)
+        self.assertEqual([_edit_signature(e) for e in first], [("Move", "c4", "c4")])
+
+        target.expressions[0].replace(parse_one("z"))
+        self.assertEqual(target.sql(), "SELECT z, c0, c1, c2, c3 FROM t")
+
+        second = [_edit_signature(e) for e in diff_delta_only(source, target)]
+        third = [_edit_signature(e) for e in diff_delta_only(source, target)]
+        self.assertEqual(second, third)
 
     def _validate_delta_only(self, actual_delta, expected_delta):
         self.assertEqual(set(actual_delta), set(expected_delta))
